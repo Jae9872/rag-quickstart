@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RAG Quickstart — Build Progress</title>
+<style>
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;max-width:760px;margin:40px auto;padding:0 20px;color:#1a1a1a;line-height:1.55}
+h1{font-size:26px;margin-bottom:4px}
+.sub{color:#666;margin-top:0}
+.step{border:1px solid #ddd;border-radius:10px;padding:16px 18px;margin:16px 0}
+.step h2{font-size:18px;margin:0 0 6px}
+.badge{display:inline-block;font-size:12px;font-weight:700;padding:2px 10px;border-radius:20px;margin-left:8px;vertical-align:middle}
+.done{background:#d8f3dc;color:#1b5e20}
+.doing{background:#fff3bf;color:#7a5b00}
+.todo{background:#eee;color:#555}
+.why{background:#f6f6f6;border-left:4px solid #888;padding:10px 12px;margin:10px 0}
+code{background:#f0f0f0;padding:2px 6px;border-radius:4px}
+pre{background:#111;color:#e8e8e8;padding:12px 14px;border-radius:8px;overflow-x:auto}
+pre code{background:none;color:inherit;padding:0}
+ol{padding-left:20px}
+.small{color:#666;font-size:14px}
+</style>
+</head>
+<body>
+<h1>RAG Quickstart — Build Progress</h1>
+<p class="sub">A tiny working RAG product, published on GitHub. Terminal first. Each step says what, why, and the exact command.</p>
+<p class="small">Last updated: 24 Oct 2026, 15:05 IST. Statuses are updated as steps complete.</p>
+<h2>How it works</h2>
+<p><img src="docs/pipeline.svg" alt="RAG pipeline: upload docs, chunk, embed, ChromaDB, ask, retrieve top 3, Gemini, cited answer" style="max-width:100%"></p>
+
+<div class="step">
+<h2>1. Get a Gemini API key <span class="badge done">DONE</span></h2>
+<p><strong>What:</strong> Jae created a Gemini API key in Google AI Studio with his Google Pro account.</p>
+<div class="why"><strong>Why:</strong> The RAG app needs a brain for generation. Gemini's free tier needs no card, and the key stays on Jae's machine only, in a <code>.env</code> file that is never uploaded.</div>
+<p><strong>Terminal check:</strong></p>
+<pre><code>ls -la .env  # exists locally, never committed
+grep -c GEMINI_API_KEY .env  # should print 1</code></pre>
+</div>
+
+<div class="step">
+<h2>2. Build the RAG app <span class="badge done">DONE</span></h2>
+<p><strong>What:</strong> FastAPI app with local embeddings (all-MiniLM-L6-v2), ChromaDB storage, and a one-page UI. Ask a question, get an answer with the source chunks shown underneath. Providers: Gemini key first, then Groq, then local Ollama/Hermes, then extractive mode with no key at all.</p>
+<div class="why"><strong>Why:</strong> This is the product. Retrieval by meaning plus cited sources is the whole point of RAG, and it is the skill ClaimSorted hires for: agents that ground answers in real documents instead of guessing.</div>
+<p><strong>Terminal:</strong></p>
+<pre><code>cd ~/workspace/rag-quickstart
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app.main:app --reload --port 8000</code></pre>
+</div>
+
+<div class="step">
+<h2>3. Run it and test with 3 questions <span class="badge doing">IN PROGRESS</span></h2>
+<p><strong>What:</strong> Start the server, open http://localhost:8000, and ask 3 questions about the seeded documents. Confirm each answer cites the right chunk.</p>
+<div class="why"><strong>Why:</strong> Nothing counts until it runs. A test with known answers proves retrieval works before real users touch it.</div>
+<p><strong>Terminal:</strong></p>
+<pre><code>curl -s http://localhost:8000/health
+curl -s -X POST http://localhost:8000/ask -H 'Content-Type: application/json' \
+  -d '{"question": "What does ClaimSorted do?"}'</code></pre>
+</div>
+
+<div class="step">
+<h2>4. Create the GitHub repo <span class="badge todo">TODO</span></h2>
+<p><strong>What:</strong> Public repo named <code>rag-quickstart</code> under Jae9872.</p>
+<div class="why"><strong>Why:</strong> Publishing turns a local experiment into proof. A public repo with a working demo is what a CTO actually opens.</div>
+<p><strong>Terminal (on Jae's Mac, where gh is logged in):</strong></p>
+<pre><code>gh repo create rag-quickstart --public --description "Tiny working RAG starter: upload docs, ask questions, get cited answers. Free tiers only."</code></pre>
+</div>
+
+<div class="step">
+<h2>5. Push the code <span class="badge todo">TODO</span></h2>
+<p><strong>What:</strong> Push the app, README, and seed docs. The <code>.env</code> file stays out via <code>.gitignore</code>.</p>
+<div class="why"><strong>Why:</strong> If the key leaks into git history, it must be revoked. The .gitignore check is the safety step before any push.</div>
+<p><strong>Terminal:</strong></p>
+<pre><code>cd ~/workspace/rag-quickstart
+cat .gitignore  # must contain: .env
+git add . && git commit -m "Minimal RAG starter with cited answers"
+git push -u origin main</code></pre>
+</div>
+
+<div class="step">
+<h2>6. Publish and share <span class="badge todo">TODO</span></h2>
+<p><strong>What:</strong> README shows the 2 commands to run it, the free tiers it uses, and a demo. Share the repo link on LinkedIn with the demo.</p>
+<div class="why"><strong>Why:</strong> A shipped tiny product that real people can use beats a big unfinished one. This is also week-one proof for the Top 1% Path.</div>
+</div>
+
+<div class="step">
+<h2>7. Next: point it at your own repos <span class="badge todo">TODO</span></h2>
+<p><strong>What:</strong> Ingest cequor-platform or medimitr docs and ask the app questions about your own code.</p>
+<div class="why"><strong>Why:</strong> RAG over your own codebase is the version of this product you actually use daily, and the natural second feature after publishing.</div>
+</div>
+
+<p class="small">Rules for this project: keys never go in chat or git. Nothing counts until it runs. One step at a time, terminal first.</p>
+</body>
+</html>
