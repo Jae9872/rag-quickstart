@@ -82,7 +82,13 @@ def embed_texts(texts):
         ]
     }
     resp = httpx.post(url, json=payload, timeout=120)
-    resp.raise_for_status()
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError:
+        # Print Google's own reason (the body never contains the key) so a
+        # 400/404 can be diagnosed instead of guessed at.
+        print(f"[v2] Gemini embedding error {resp.status_code}: {resp.text[:500]}")
+        raise
     out = []
     for emb in resp.json()["embeddings"]:
         out.append(emb["values"])
