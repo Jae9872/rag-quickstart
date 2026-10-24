@@ -35,7 +35,9 @@ DB_PATH = BASE / "rag.db"
 # text-embedding-004 was retired from v1beta (Google returns 404 for it);
 # gemini-embedding-001 is its current replacement.
 EMBED_MODEL = "gemini-embedding-001"
-GEN_MODELS = ("gemini-2.5-flash", "gemini-2.0-flash")
+# 2.5-flash and 2.0-flash are retired for new users (Google returns 404
+# telling callers to use gemini-3.8-flash). Keep a fallback in the same family.
+GEN_MODELS = ("gemini-3.8-flash", "gemini-3.5-flash")
 TOP_K = 4
 
 app = FastAPI(title="RAG Quickstart v2")
@@ -71,29 +73,32 @@ def chunk_text(text: str, size: int = 800, overlap: int = 100):
 
 
 def embed_texts(texts):
-    """Gemini embeddings over REST. Returns a list of float lists."""
+    """Gemini embeddings over REST. Returns a list of float lists.
+
+    gemini-embedding-001 supports embedContent (one text per call), NOT
+    batchEmbedContents, so we loop. Fine at this scale; a bulk path can
+    move to asyncBatchEmbedContent later.
+    """
     key = require_key()
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{EMBED_MODEL}:batchEmbedContents?key={key}"
+        f"{EMBED_MODEL}:embedContent?key={key}"
     )
-    payload = {
-        "requests": [
-            {"model": f"models/{EMBED_MODEL}", "content": {"parts": [{"text": t}]}}
-            for t in texts
-        ]
-    }
-    resp = httpx.post(url, json=payload, timeout=120)
-    try:
-        resp.raise_for_status()
-    except httpx.HTTPStatusError:
-        # Print Google's own reason (the body never contains the key) so a
-        # 400/404 can be diagnosed instead of guessed at.
-        print(f"[v2] Gemini embedding error {resp.status_code}: {resp.text[:500]}")
-        raise
     out = []
-    for emb in resp.json()["embeddings"]:
-        out.append(emb["values"])
+    for t in texts:
+        payload = {
+            "model": f"models/{EMBED_MODEL}",
+            "content": {"parts": [{"text": t}]},
+        }
+        resp = httpx.post(url, json=payload, timeout=120)
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError:
+            # Print Google's own reason (the body never contains the key)
+            # so a 400/404 can be diagnosed instead of guessed at.
+            print(f"[v2] Gemini embedding error {resp.status_code}: {resp.text[:500]}")
+            raise
+        out.append(resp.json()["embedding"]["values"])
     return out
 
 
@@ -172,20 +177,27 @@ def generate_answer(question: str, sources) -> str:
             "https://generativelanguage.googleapis.com/v1beta/models/"
             f"{model}:generateContent?key={key}"
         )
-        resp = httpx.post(
-            url,
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0.2},
-            },
-            timeout=120,
-        )
-        if resp.status_code == 200:
-            parts = resp.json()["candidates"][0]["content"]["parts"]
-            return "".join(p.get("text", "") for p in parts)
-        last_error = f"Gemini {model} returned HTTP {resp.status_code}"
-        if resp.status_code not in (400, 404):
-            resp.raise_for_status()
+        # Two tries per model: generation can time out on a slow route
+        # even when the model itself is fine.
+        for attempt in range(2):
+            try:
+                resp = httpx.post(
+                    url,
+                    json={
+                        "contents": [{"parts": [{"text": prompt}]}],
+                        "generationConfig": {"temperature": 0.2},
+                    },
+                    timeout=120,
+                )
+            except httpx.HTTPError as e:
+                last_error = f"Gemini {model} request failed: {type(e).__name__}"
+                continue
+            if resp.status_code == 200:
+                parts = resp.json()["candidates"][0]["content"]["parts"]
+                return "".join(p.get("text", "") for p in parts)
+            last_error = f"Gemini {model} returned HTTP {resp.status_code}"
+            if resp.status_code not in (400, 404):
+                break
     raise RuntimeError(last_error or "Gemini generation failed")
 
 
@@ -209,7 +221,7 @@ def health():
         "status": "ok",
         "chunks_indexed": count,
         "embedding_model": EMBED_MODEL,
-        "llm": "gemini-2.5-flash (fallback gemini-2.0-flash)"
+        "llm": "gemini-3.8-flash (fallback gemini-3.5-flash)"
         if key_set
         else "not configured — GEMINI_API_KEY is not set",
         "gemini_key_set": key_set,
@@ -268,7 +280,8 @@ def ask(body: AskIn):
         }
     try:
         answer = generate_answer(body.question, sources)
-    except RuntimeError as e:
+    except Exception as e:
+        # Never leak a bare 500: the UI and curl both get a JSON error.
         return JSONResponse({"error": str(e)}, status_code=503)
     return {
         "answer": answer,

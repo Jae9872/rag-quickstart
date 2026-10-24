@@ -36,7 +36,7 @@ over REST, with a key, retries and fallbacks, instead of a local model.
   Retrieve top 4 by pure-Python cosine similarity
         │
         ▼
-  Gemini generate (2.5-flash, fallback 2.0-flash)
+  Gemini generate (3.8-flash, fallback 3.5-flash)
         │
         ▼
   Cited answer: answer ONLY from the chunks, [doc chunk n],
