@@ -24,7 +24,7 @@ over REST, with a key, retries and fallbacks, instead of a local model.
      Chunk (~800 words, 100 overlap)
         │
         ▼
-  Gemini embed (text-embedding-004, REST)
+  Gemini embed (gemini-embedding-001, REST)
         │
         ▼
   SQLite vectors (stdlib only, vectors as JSON lists)

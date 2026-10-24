@@ -32,7 +32,9 @@ from pydantic import BaseModel
 BASE = Path(__file__).parent
 SEED_DIR = BASE / "seed_docs"
 DB_PATH = BASE / "rag.db"
-EMBED_MODEL = "text-embedding-004"
+# text-embedding-004 was retired from v1beta (Google returns 404 for it);
+# gemini-embedding-001 is its current replacement.
+EMBED_MODEL = "gemini-embedding-001"
 GEN_MODELS = ("gemini-2.5-flash", "gemini-2.0-flash")
 TOP_K = 4
 
