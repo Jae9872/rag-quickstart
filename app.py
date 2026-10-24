@@ -1,62 +1,65 @@
-"""RAG quickstart: FastAPI + ChromaDB + fastembed embeddings, optional LLM.
+"""RAG Quickstart v2: FastAPI + Gemini embeddings + SQLite vectors.
 
-Run:  source .venv/bin/activate && uvicorn app:app --port 8000
-LLM provider priority: GROQ_API_KEY, then GEMINI_API_KEY, then Ollama
-(local, OLLAMA_MODEL or auto-detected Hermes model), then extractive mode.
-With no provider at all the app still works in extractive mode: it returns
-the top retrieved chunks and says clearly which key would enable generation.
+Why v2 exists: v1 used ChromaDB + fastembed, which need onnxruntime, and
+onnxruntime had no builds for Python 3.15 — so v1 forced a Python 3.12
+downgrade. v2 removes that dependency entirely: embeddings come from a
+real vendor API (Google Gemini text-embedding-004 over REST), vectors are
+stored in SQLite via the Python standard library, and similarity is pure
+Python cosine similarity. Dependencies are ONLY fastapi, uvicorn, httpx
+and python-multipart — all pure Python, so this runs on Python 3.15
+(and any other modern Python) with no native wheels at all.
+
+Run:  python3 -m venv .venv && source .venv/bin/activate
+      pip install -r requirements.txt
+      GEMINI_API_KEY=your-key-here uvicorn app:app --port 8000
+
+Behaviour: the app answers ONLY from retrieved chunks, cites
+[doc chunk n], and says plainly when the context lacks the answer.
+Without GEMINI_API_KEY it does not crash and never fakes an answer: the
+endpoints return a clear error naming the missing key.
 """
+import json
+import math
 import os
-import re
+import sqlite3
 from pathlib import Path
 
 import httpx
-
-import chromadb
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
-from fastembed import TextEmbedding
 from pydantic import BaseModel
 
 BASE = Path(__file__).parent
 SEED_DIR = BASE / "seed_docs"
-CHROMA_DIR = BASE / "chroma_db"
-MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+DB_PATH = BASE / "rag.db"
+EMBED_MODEL = "text-embedding-004"
+GEN_MODELS = ("gemini-2.5-flash", "gemini-2.0-flash")
 TOP_K = 4
 
-app = FastAPI(title="RAG Quickstart")
-_embedder = None
-_client = None
-_collection = None
+app = FastAPI(title="RAG Quickstart v2")
 
 
-def embedder():
-    """fastembed running the same all-MiniLM-L6-v2 model via ONNX.
-
-    Real vector embeddings (384-dim), not keyword search. fastembed was
-    chosen over sentence-transformers here because the full torch install
-    (550MB+ CUDA wheel) was too heavy/slow for this VM.
-    """
-    global _embedder
-    if _embedder is None:
-        _embedder = TextEmbedding(model_name=MODEL_NAME)
-    return _embedder
+def require_key() -> str:
+    key = os.getenv("GEMINI_API_KEY")
+    if not key:
+        raise RuntimeError(
+            "GEMINI_API_KEY is not set. Get a free key at "
+            "https://aistudio.google.com, then run with "
+            "GEMINI_API_KEY=your-key-here uvicorn app:app --port 8000"
+        )
+    return key
 
 
-def encode(texts):
-    return [e.tolist() for e in embedder().embed(texts)]
-
-
-def collection():
-    global _client, _collection
-    if _collection is None:
-        _client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-        _collection = _client.get_or_create_collection("docs")
-    return _collection
+def db():
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS chunks "
+        "(id TEXT PRIMARY KEY, doc TEXT, chunk INTEGER, text TEXT, vector TEXT)"
+    )
+    return conn
 
 
 def chunk_text(text: str, size: int = 800, overlap: int = 100):
-    """Split text into overlapping chunks on sentence/word boundaries."""
     words = text.split()
     chunks, i = [], 0
     while i < len(words):
@@ -65,78 +68,143 @@ def chunk_text(text: str, size: int = 800, overlap: int = 100):
     return [c for c in chunks if c.strip()]
 
 
-def ingest_text(doc_name: str, text: str):
-    col = collection()
+def embed_texts(texts):
+    """Gemini embeddings over REST. Returns a list of float lists."""
+    key = require_key()
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{EMBED_MODEL}:batchEmbedContents?key={key}"
+    )
+    payload = {
+        "requests": [
+            {"model": f"models/{EMBED_MODEL}", "content": {"parts": [{"text": t}]}}
+            for t in texts
+        ]
+    }
+    resp = httpx.post(url, json=payload, timeout=120)
+    resp.raise_for_status()
+    out = []
+    for emb in resp.json()["embeddings"]:
+        out.append(emb["values"])
+    return out
+
+
+def ingest_text(doc_name: str, text: str) -> int:
     chunks = chunk_text(text)
     if not chunks:
         return 0
-    embs = encode(chunks)
-    ids = [f"{doc_name}#{n}" for n in range(len(chunks))]
-    col.upsert(
-        ids=ids,
-        documents=chunks,
-        embeddings=embs,
-        metadatas=[{"doc": doc_name, "chunk": n} for n in range(len(chunks))],
-    )
+    vectors = embed_texts(chunks)
+    conn = db()
+    for n, (chunk, vec) in enumerate(zip(chunks, vectors)):
+        conn.execute(
+            "INSERT OR REPLACE INTO chunks (id, doc, chunk, text, vector) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (f"{doc_name}#{n}", doc_name, n, chunk, json.dumps(vec)),
+        )
+    conn.commit()
+    conn.close()
     return len(chunks)
 
 
-def seed_if_empty():
-    col = collection()
-    if col.count() > 0:
-        return col.count()
+def seed_if_empty() -> int:
+    conn = db()
+    count = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    conn.close()
+    if count > 0:
+        return count
     total = 0
     for path in sorted(SEED_DIR.glob("*.md")):
         total += ingest_text(path.name, path.read_text())
     return total
 
 
+def cosine(a, b) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot / (na * nb)
+
+
+def retrieve(question: str, k: int = TOP_K):
+    qvec = embed_texts([question])[0]
+    conn = db()
+    rows = conn.execute("SELECT doc, chunk, text, vector FROM chunks").fetchall()
+    conn.close()
+    scored = []
+    for doc, chunk, text, vec_json in rows:
+        scored.append(
+            {
+                "doc": doc,
+                "chunk": chunk,
+                "text": text,
+                "score": round(cosine(qvec, json.loads(vec_json)), 4),
+            }
+        )
+    scored.sort(key=lambda s: s["score"], reverse=True)
+    return scored[:k]
+
+
+SYSTEM_PROMPT = (
+    "Answer ONLY from the context below. Cite sources like [doc chunk n]. "
+    "If the context does not contain the answer, say so plainly."
+)
+
+
+def generate_answer(question: str, sources) -> str:
+    key = require_key()
+    context = "\n\n".join(
+        f"[{s['doc']} chunk {s['chunk']}] {s['text']}" for s in sources
+    )
+    prompt = f"{SYSTEM_PROMPT}\n\nContext:\n{context}\n\nQuestion: {question}"
+    last_error = None
+    for model in GEN_MODELS:
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model}:generateContent?key={key}"
+        )
+        resp = httpx.post(
+            url,
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"temperature": 0.2},
+            },
+            timeout=120,
+        )
+        if resp.status_code == 200:
+            parts = resp.json()["candidates"][0]["content"]["parts"]
+            return "".join(p.get("text", "") for p in parts)
+        last_error = f"Gemini {model} returned HTTP {resp.status_code}"
+        if resp.status_code not in (400, 404):
+            resp.raise_for_status()
+    raise RuntimeError(last_error or "Gemini generation failed")
+
+
 @app.on_event("startup")
 def startup():
-    seed_if_empty()
-
-
-def active_provider():
-    """Return (name, detail) for the first available LLM provider, else None.
-
-    Priority: Groq, then Gemini, then local Ollama. No keys are required
-    to run the app — with none of these, ask() falls back to extractive.
-    """
-    if os.getenv("GROQ_API_KEY"):
-        return ("groq", "openai/gpt-oss-20b")
-    if os.getenv("GEMINI_API_KEY"):
-        return ("gemini", "gemini-2.5-flash")
-    model = detect_ollama_model()
-    if model:
-        return ("ollama", model)
-    return None
-
-
-def detect_ollama_model():
-    """Pick OLLAMA_MODEL if set, else a Hermes model if installed, else any
-    installed model. Returns None when Ollama is not reachable."""
-    forced = os.getenv("OLLAMA_MODEL")
-    if forced:
-        return forced
+    # Seeding needs a key; without one the app still starts and the
+    # endpoints explain what is missing instead of crashing.
     try:
-        resp = httpx.get("http://localhost:11434/api/tags", timeout=3)
-        models = [m["name"] for m in resp.json().get("models", [])]
-    except Exception:
-        return None
-    for name in models:
-        if "hermes" in name.lower():
-            return name
-    return models[0] if models else None
+        seed_if_empty()
+    except Exception as e:
+        print(f"[v2] startup seeding skipped: {e}")
 
 
 @app.get("/health")
 def health():
-    provider = active_provider()
+    conn = db()
+    count = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    conn.close()
+    key_set = bool(os.getenv("GEMINI_API_KEY"))
     return {
         "status": "ok",
-        "chunks_indexed": collection().count(),
-        "embedding_model": MODEL_NAME,
-        "llm": f"{provider[0]} ({provider[1]})" if provider else "extractive (no GROQ_API_KEY, GEMINI_API_KEY, or Ollama model found)",
+        "chunks_indexed": count,
+        "embedding_model": EMBED_MODEL,
+        "llm": "gemini-2.5-flash (fallback gemini-2.0-flash)"
+        if key_set
+        else "not configured — GEMINI_API_KEY is not set",
+        "gemini_key_set": key_set,
     }
 
 
@@ -151,132 +219,54 @@ class AskIn(BaseModel):
 
 @app.post("/ingest")
 async def ingest(file: UploadFile = File(None), text: str = Form(None)):
-    if file is not None:
-        raw = await file.read()
-        doc_name = file.filename or "upload.txt"
-        try:
-            content = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            return JSONResponse({"error": "Only .txt/.md (UTF-8) files are supported."}, status_code=400)
-    elif text:
-        doc_name = "pasted-text.txt"
-        content = text
-    else:
-        return JSONResponse({"error": "Send a file or raw text."}, status_code=400)
-    n = ingest_text(doc_name, content)
-    return {"doc": doc_name, "chunks_added": n, "total_chunks": collection().count()}
-
-
-def retrieve(question: str, k: int = TOP_K):
-    col = collection()
-    if col.count() == 0:
-        return []
-    emb = encode([question])
-    res = col.query(query_embeddings=emb, n_results=min(k, col.count()))
-    sources = []
-    for doc, meta, dist in zip(res["documents"][0], res["metadatas"][0], res["distances"][0]):
-        sources.append({"doc": meta["doc"], "chunk": meta["chunk"], "distance": round(float(dist), 4), "text": doc})
-    return sources
-
-
-def highlight(text: str, question: str) -> str:
-    """Bold the question words found in a chunk (simple, for extractive mode)."""
-    words = {w.strip("?,.") for w in question.lower().split() if len(w) > 3}
-    out = text
-    for w in sorted(words, key=len, reverse=True):
-        out = re.sub(rf"(?i)\b({re.escape(w)})\b", r"**\1**", out, count=2)
-    return out
-
-
-SYSTEM_PROMPT = (
-    "Answer ONLY from the context below. Cite sources like [doc chunk n]. "
-    "If the context does not contain the answer, say so plainly."
-)
-
-
-def _groq_answer(prompt: str) -> str:
-    from groq import Groq
-    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-    resp = client.chat.completions.create(
-        model="openai/gpt-oss-20b",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.2,
-    )
-    return resp.choices[0].message.content
-
-
-def _gemini_answer(prompt: str) -> str:
-    """Gemini via REST (no extra SDK needed). Tries 2.5-flash, then 2.0-flash."""
-    key = os.getenv("GEMINI_API_KEY")
-    for model in ("gemini-2.5-flash", "gemini-2.0-flash"):
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-        resp = httpx.post(url, json={
-            "contents": [{"parts": [{"text": SYSTEM_PROMPT + "\n\n" + prompt}]}],
-            "generationConfig": {"temperature": 0.2},
-        }, timeout=60)
-        if resp.status_code == 200:
-            parts = resp.json()["candidates"][0]["content"]["parts"]
-            return "".join(p.get("text", "") for p in parts)
-        if resp.status_code not in (400, 404):
-            resp.raise_for_status()
-    raise RuntimeError("Gemini: neither gemini-2.5-flash nor gemini-2.0-flash accepted the request")
-
-
-def _ollama_answer(prompt: str, model: str) -> str:
-    resp = httpx.post("http://localhost:11434/api/generate", json={
-        "model": model,
-        "prompt": SYSTEM_PROMPT + "\n\n" + prompt,
-        "stream": False,
-        "options": {"temperature": 0.2},
-    }, timeout=180)
-    resp.raise_for_status()
-    return resp.json()["response"]
-
-
-def generate_answer(question: str, sources):
-    """Try providers in priority order. Returns (answer, mode, failed_note).
-
-    mode is one of groq/gemini/ollama/extractive. A provider failure never
-    crashes the endpoint: it falls back to extractive mode with a note.
-    """
-    context = "\n\n".join(f"[{s['doc']} chunk {s['chunk']}] {s['text']}" for s in sources)
-    prompt = f"Context:\n{context}\n\nQuestion: {question}"
-    provider = active_provider()
-    if provider:
-        name, detail = provider
-        try:
-            if name == "groq":
-                return _groq_answer(prompt), "groq", None
-            if name == "gemini":
-                return _gemini_answer(prompt), "gemini", None
-            return _ollama_answer(prompt, detail), "ollama", None
-        except Exception as e:
-            return None, "extractive", f"({name} call failed: {e}. Falling back to extractive mode.)"
-    return None, "extractive", None
+    try:
+        if file is not None:
+            raw = await file.read()
+            doc_name = file.filename or "upload.txt"
+            try:
+                content = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                return JSONResponse(
+                    {"error": "Only .txt/.md (UTF-8) files are supported."},
+                    status_code=400,
+                )
+        elif text:
+            doc_name = "pasted-text.txt"
+            content = text
+        else:
+            return JSONResponse(
+                {"error": "Send a file or raw text."}, status_code=400
+            )
+        n = ingest_text(doc_name, content)
+    except RuntimeError as e:
+        return JSONResponse({"error": str(e)}, status_code=503)
+    conn = db()
+    total = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    conn.close()
+    return {"doc": doc_name, "chunks_added": n, "total_chunks": total}
 
 
 @app.post("/ask")
 def ask(body: AskIn):
-    sources = retrieve(body.question)
+    try:
+        sources = retrieve(body.question)
+    except RuntimeError as e:
+        return JSONResponse({"error": str(e)}, status_code=503)
     if not sources:
-        return {"answer": "No documents are indexed yet. Upload a file first.", "sources": [], "mode": "empty"}
-    answer, mode, failed_note = generate_answer(body.question, sources)
-    if mode == "extractive":
-        top = sources[0]
-        passage = highlight(top["text"], body.question)
-        if failed_note:
-            answer = failed_note + "\n\nMost relevant passage:\n\n" + passage
-        else:
-            answer = (
-                "Extractive mode — no LLM provider found. Set GROQ_API_KEY or "
-                "GEMINI_API_KEY, or run Ollama locally (see README), for "
-                "generated answers.\n\nMost relevant passage:\n\n" + passage
-            )
+        return {
+            "answer": "No documents are indexed yet. Upload a file first.",
+            "sources": [],
+            "mode": "empty",
+        }
+    try:
+        answer = generate_answer(body.question, sources)
+    except RuntimeError as e:
+        return JSONResponse({"error": str(e)}, status_code=503)
     return {
         "answer": answer,
-        "sources": [{"doc": s["doc"], "chunk": s["chunk"], "text": s["text"]} for s in sources],
-        "mode": mode,
+        "sources": [
+            {"doc": s["doc"], "chunk": s["chunk"], "text": s["text"]}
+            for s in sources
+        ],
+        "mode": "gemini",
     }

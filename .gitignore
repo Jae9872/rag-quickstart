@@ -1,5 +1,5 @@
 .env
 .venv/
-chroma_db/
+rag.db
 __pycache__/
-*.pyc
+server.log

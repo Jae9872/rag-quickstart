@@ -1,83 +1,65 @@
-# RAG Quickstart
+# RAG Quickstart v2 — latest Python, zero heavy dependencies
 
 A working RAG product you can run on your own machine, free. Ask a question,
 get an answer with the source chunks underneath. That citation part is the
 whole point: an answer without a source is not usable in regulated work.
 
-![How it works: upload → chunk → embed → ChromaDB → ask → retrieve → Gemini → cited answer](docs/pipeline.svg)
+## Why v2 exists
 
-Stack: Python 3, FastAPI + Uvicorn, ChromaDB (local, persistent),
-fastembed running the `sentence-transformers/all-MiniLM-L6-v2` model via ONNX (free, local,
-real 384-dim vector embeddings, no key). Note: the original spec used
-sentence-transformers, but its install pulls a 550MB+ CUDA torch wheel
-that stalled on this VM, so the embedding backend was switched to
-fastembed running the same model. Retrieval is still genuine vector
-similarity search, not keyword search.
+v1 used ChromaDB + fastembed, which need onnxruntime, and onnxruntime had
+no builds for Python 3.15 — so v1 forced a Python 3.12 downgrade. v2 removes
+that dependency entirely: embeddings come from a real vendor API (Google
+Gemini), vectors live in SQLite, and similarity is pure Python. The only
+dependencies are fastapi, uvicorn, httpx and python-multipart — all pure
+Python wheels — so v2 runs on Python 3.15 with nothing native to compile
+or wait on. This is also the integration lesson: calling a real vendor API
+over REST, with a key, retries and fallbacks, instead of a local model.
 
-## LLM providers (priority order — first available wins)
+## How it works
 
-1. **Groq** — `GROQ_API_KEY`, model `openai/gpt-oss-20b`. Free, no card.
-2. **Google Gemini** — `GEMINI_API_KEY`, model `gemini-2.5-flash`
-   (falls back to `gemini-2.0-flash` if 2.5 is not accepted).
-3. **Ollama, local** — no key at all. Set `OLLAMA_MODEL` to a model name,
-   or leave it unset and the app auto-detects: a Hermes model first if one
-   is installed, otherwise any installed model. Ollama runs at
-   http://localhost:11434.
-
-With none of the three, the app runs in extractive mode: it returns the
-top retrieved chunks with the most relevant passage highlighted, and says
-clearly which option would enable generation. Nothing ever crashes for
-lack of a key.
-
-## How to run (2 commands)
-
-```bash
-cd ~/workspace/rag-quickstart
-source .venv/bin/activate && uvicorn app:app --port 8000
+```text
+  Upload docs (.txt / .md)
+        │
+        ▼
+     Chunk (~800 words, 100 overlap)
+        │
+        ▼
+  Gemini embed (text-embedding-004, REST)
+        │
+        ▼
+  SQLite vectors (stdlib only, vectors as JSON lists)
+        │
+        ▼
+  Ask a question ──▶ Gemini embed the question
+        │
+        ▼
+  Retrieve top 4 by pure-Python cosine similarity
+        │
+        ▼
+  Gemini generate (2.5-flash, fallback 2.0-flash)
+        │
+        ▼
+  Cited answer: answer ONLY from the chunks, [doc chunk n],
+  or a plain "the context does not contain the answer"
 ```
 
-Then open http://127.0.0.1:8000 in your browser. On first run the app
-ingests the 3 seed documents in `seed_docs/` automatically.
-
-## How to get a free Groq key (no card)
-
-1. Go to https://groq.com and create a free account.
-2. Open the API Keys page and create a key.
-3. Run the server with it set:
+## Run it
 
 ```bash
-GROQ_API_KEY=your_key_here uvicorn app:app --port 8000
+cd ~/workspace/rag-quickstart-v2
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+GEMINI_API_KEY=your-key-here uvicorn app:app --port 8000
 ```
 
-## How to get a free Gemini key (AI Studio, no card)
+Then open http://127.0.0.1:8000. On first run (with a key set) the app
+ingests the 3 seed documents in `seed_docs/` automatically: a ClaimSorted
+product summary, a fictional policy wording excerpt, and a RAG explainer.
 
-1. Go to https://aistudio.google.com and sign in with your Google account.
-2. Get an API key from the API Keys page.
-3. Run the server with it set:
+Get a free key at https://aistudio.google.com (no card). Never put the key
+in chat or in git — pass it as an environment variable only.
 
-```bash
-GEMINI_API_KEY=your_key_here uvicorn app:app --port 8000
-```
-
-## How to use Ollama (fully local, no key)
-
-1. Install Ollama from https://ollama.com and pull a model, e.g.
-   `ollama pull hermes3` (or whatever Hermes model you already have).
-2. Make sure Ollama is running (`ollama list` shows your models).
-3. Run the server normally — with no keys set, it auto-detects your
-   Hermes model. To force a specific model:
-
-```bash
-OLLAMA_MODEL=hermes3 uvicorn app:app --port 8000
-```
-
-With any provider set, answers are generated from the retrieved chunks and
-still cite their sources. Without one, nothing crashes — you get
-extractive mode instead.
-
-## How to test it (3 example questions)
-
-Ask these in the UI or with curl:
+## Test it (3 questions)
 
 ```bash
 curl -s -X POST http://127.0.0.1:8000/ask -H 'Content-Type: application/json' \
@@ -92,35 +74,38 @@ curl -s -X POST http://127.0.0.1:8000/ask -H 'Content-Type: application/json' \
 
 curl -s -X POST http://127.0.0.1:8000/ask -H 'Content-Type: application/json' \
   -d '{"question": "What is an eval in a RAG system?"}'
-# Expected: a test for a RAG system (right chunk cited, refuses when the
-# documents lack the answer, stays accurate as documents grow), cited
-# from 03-how-rag-works.md.
-```
-
-## Troubleshooting
-
-**`No matching distribution found for onnxruntime` on install:** your Python
-is too new (3.14+ has no onnxruntime builds yet). Use Python 3.12:
-
-```bash
-brew install python@3.12
-deactivate; rm -rf .venv
-python3.12 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+# Expected: a test for a RAG system, cited from 03-how-rag-works.md.
 ```
 
 ## Endpoints
 
 - `GET /` — the single-page UI (ask + upload).
 - `GET /health` — status, chunk count, embedding model, LLM mode.
-- `POST /ask` — `{"question": "..."}` returns `{"answer", "sources": [{doc, chunk, text}], "mode"}`.
+- `POST /ask` — `{"question": "..."}` returns `{"answer", "sources", "mode"}`.
 - `POST /ingest` — multipart file upload (`.txt`/`.md`) or a `text` form field.
+
+Without `GEMINI_API_KEY` the server still starts, `/health` reports the key
+as unset, and `/ask` / `/ingest` return HTTP 503 with a clear message
+naming the missing key. Nothing crashes, and nothing fakes an answer.
+
+## Honest scale note
+
+Pure-Python cosine similarity over SQLite is correct and fast enough for
+hundreds to low thousands of chunks — exactly this project's scale. It is
+a linear scan: every query compares against every chunk, so cost grows
+with the collection. Beyond that, move to a real vector index: Supabase
+pgvector is the next integration lesson (managed Postgres + the `vector`
+extension + an index, same retrieve-then-generate shape, no application
+code change to the answering logic). Do not reach for a vector database
+before you need one; do reach for it the moment query latency or chunk
+count makes the scan noticeable.
 
 ## Files
 
-- `app.py` — the whole backend + retrieval + generation logic.
+- `app.py` — the whole backend: chunking, Gemini REST calls, SQLite
+  storage, pure-Python retrieval, cited generation.
 - `index.html` — the UI, served by FastAPI, no build step.
 - `seed_docs/` — 3 seed documents (ClaimSorted summary, fictional policy
   wording, RAG explainer). All invented/fictional where marked; no real
   company data.
-- `chroma_db/` — the persistent ChromaDB store (created on first run).
+- `rag.db` — the SQLite store, created on first run (not committed).
